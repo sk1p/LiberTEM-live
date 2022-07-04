@@ -4,6 +4,10 @@ from libertem.common.executor import (
 )
 
 
+def _poll_for_files(base_path: str) -> List[Tuple[str, Tuple[int, int]]]:
+    pass
+
+
 def _ordered_files(base_path: str, end_idx: int):
     # which files have we "yielded" already?
     files_done = {}
@@ -13,7 +17,7 @@ def _ordered_files(base_path: str, end_idx: int):
 
     while True:
         # slice here means a tuple (start_idx, end_idx)
-        files_and_slices = _poll_for_new_files(base_path)
+        files_and_slices = _poll_for_files(base_path)
         todo_files = [
             (f, slice_)
             for (f, slice_) in files_and_slices
