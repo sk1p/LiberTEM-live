@@ -1,90 +1,92 @@
 import os
 
+import numpy as np
 import pytest
+import h5py
 
 from libertem_live.files import FileWatcherSource, FilesController
 from libertem.common import Slice, Shape
 from libertem.common.executor import SimpleWorkerQueue
 
 
-def _touch(path):
+def _touch(path, num_frames):
     if not os.path.exists(path):
-        with open(path, "wb"):
-            pass
+        with h5py.File(path, "w") as f:
+            f.create_dataset("data", (num_frames, 64, 64), dtype=np.float32)
 
 
 def test_watcher_source_in_order(tmp_path):
     d = tmp_path / "base_for_watcher"
     d.mkdir()
 
-    watcher = FileWatcherSource(d)
+    watcher = FileWatcherSource(d, ds_path="/data")
 
     files = watcher.ordered_files(4096)
 
     assert next(files) is None
 
-    # first file, as expected starting with index 0, will be yielded directly:
-    _touch(d / "prefix_0000_0128.ext")
-    assert next(files) == (
-        str(d / "prefix_0000_0128.ext"),
-        (0, 128)
-    )
+    # first file, as expected starting with index 1, will be yielded directly:
+    _touch(d / "scan_000123_data_000001.h5", num_frames=128)
+    n = next(files)
+    assert n.name == "scan_000123_data_000001.h5"
+    assert n.num_frames == 128
+    assert n.start_idx == 0
+    assert n.end_idx == 128
 
     # directly following in index order:
-    _touch(d / "prefix_0128_0256.ext")
-    assert next(files) == (
-        str(d / "prefix_0128_0256.ext"),
-        (128, 256)
-    )
+    _touch(d / "scan_000123_data_000002.h5", num_frames=128)
+
+    n = next(files)
+    assert n.name == "scan_000123_data_000002.h5"
+    assert n.num_frames == 128
+    assert n.start_idx == 128
+    assert n.end_idx == 256
 
 
 def test_watcher_source_out_of_order(tmp_path):
     d = tmp_path / "base_for_watcher"
     d.mkdir()
 
-    watcher = FileWatcherSource(d)
+    watcher = FileWatcherSource(d, ds_path="/data")
 
     files = watcher.ordered_files(4096)
 
     assert next(files) is None
 
-    # first file, as expected starting with index 0, will be yielded directly:
-    _touch(d / "prefix_0000_0128.ext")
-    assert next(files) == (
-        str(d / "prefix_0000_0128.ext"),
-        (0, 128)
-    )
+    # first file, as expected starting with index 1, will be yielded directly:
+    _touch(d / "scan_000123_data_000001.h5", num_frames=128)
+    n = next(files)
+    assert n.name == "scan_000123_data_000001.h5"
+    assert n.num_frames == 128
+    assert n.start_idx == 0
+    assert n.end_idx == 128
 
     # directly following in index order:
-    _touch(d / "prefix_0128_0256.ext")
-    assert next(files) == (
-        str(d / "prefix_0128_0256.ext"),
-        (128, 256)
-    )
+    _touch(d / "scan_000123_data_000002.h5", num_frames=128)
+    n = next(files)
+    assert n.name == "scan_000123_data_000002.h5"
+    assert n.num_frames == 128
+    assert n.start_idx == 128
+    assert n.end_idx == 256
 
     # not in order, so not yielded but put into "back buffer":
-    _touch(d / "prefix_0512_0768.ext")
+    _touch(d / "scan_000123_data_000004.h5", num_frames=128)
     assert next(files) is None
 
     # so if we add the missing piece...
-    _touch(d / "prefix_0256_0512.ext")
+    _touch(d / "scan_000123_data_000003.h5", num_frames=128)
 
     # both will be yielded:
-    assert next(files) == (
-        str(d / "prefix_0256_0512.ext"),
-        (256, 512)
-    )
-    assert next(files) == (
-        str(d / "prefix_0512_0768.ext"),
-        (512, 768)
-    )
+    n = next(files)
+    assert n.start_idx == 256
+    n = next(files)
+    assert n.start_idx == 384
 
     # now let's go to the end:
-    _touch(d / "prefix_0768_4096.ext")
-    assert next(files) == (
-        str(d / "prefix_0768_4096.ext"),
-        (768, 4096)
-    )
+    _touch(d / "scan_000123_data_000005.h5", num_frames=4096 - 512)
+    n = next(files)
+    assert n.start_idx == 512
+    assert n.end_idx == 4096
 
     # and we are done:
     with pytest.raises(StopIteration):
@@ -95,13 +97,14 @@ def test_watcher_source_non_zero_start(tmp_path):
     d = tmp_path / "base_for_watcher"
     d.mkdir()
 
-    watcher = FileWatcherSource(d)
+    watcher = FileWatcherSource(d, ds_path="/data")
 
     files = watcher.ordered_files(4096)
 
     assert next(files) is None
-    _touch(d / "prefix_0128_0256.ext")
-    assert next(files) is None
+    _touch(d / "scan_000123_data_000002.h5", num_frames=128)
+    n = next(files)
+    assert n is None
 
 
 class MockPartition:
@@ -131,7 +134,12 @@ def test_files_controller_timeout(tmp_path):
     d.mkdir()
 
     q = SimpleWorkerQueue()
-    c = FilesController(str(d), 1024, timeout=0.4)
+    c = FilesController(
+        base_path=str(d),
+        ds_path="/data",
+        end_idx=1024,
+        timeout=0.4
+    )
 
     t0 = MockTask(0, 128)
 
@@ -145,12 +153,17 @@ def test_files_controller_handle_task(tmp_path):
     d.mkdir()
 
     q = SimpleWorkerQueue()
-    c = FilesController(str(d), 2048, timeout=0.4)
+    c = FilesController(
+        base_path=str(d),
+        ds_path="/data",
+        end_idx=2048,
+        timeout=0.4
+    )
 
     # single file per task:
     t0 = MockTask(0, 128)
-    f0 = d / "prefix_0000_0128"
-    _touch(f0)
+    f0 = d / "scan_000123_data_000001.h5"
+    _touch(f0, num_frames=128)
     c.handle_task(t0, q)
     with q.get(block=False) as msg:
         msg, _ = msg
@@ -161,12 +174,18 @@ def test_files_controller_handle_task(tmp_path):
             "file_end_idx": 128,
         }
 
+    with q.get(block=False) as msg:
+        msg, _ = msg
+        assert msg == {
+            "type": "END_PARTITION",
+        }
+
     # multiple files per task:
     t1 = MockTask(128, 256)
-    f1 = d / "prefix_0128_0192"
-    f2 = d / "prefix_0192_0256"
-    _touch(f1)
-    _touch(f2)
+    f1 = d / "scan_000123_data_000002.h5"
+    f2 = d / "scan_000123_data_000003.h5"
+    _touch(f1, num_frames=64)
+    _touch(f2, num_frames=64)
     c.handle_task(t1, q)
     with q.get(block=False) as msg:
         msg, _ = msg
@@ -185,12 +204,17 @@ def test_files_controller_handle_task(tmp_path):
             "file_end_idx": 256,
         }
 
-    # overlap into the next task:
+    with q.get(block=False) as msg:
+        msg, _ = msg
+        assert msg == {
+            "type": "END_PARTITION",
+        }
 
+    # overlap into the next task:
     t2 = MockTask(256, 384)
     t3 = MockTask(384, 1024)
-    f3 = d / "prefix_0256_1024"
-    _touch(f3)
+    f3 = d / "scan_000123_data_000004.h5"
+    _touch(f3, num_frames=768)
     c.handle_task(t2, q)
     with q.get(block=False) as msg:
         msg, _ = msg
@@ -211,10 +235,16 @@ def test_files_controller_handle_task(tmp_path):
             "file_end_idx": 1024,
         }
 
+    with q.get(block=False) as msg:
+        msg, _ = msg
+        assert msg == {
+            "type": "END_PARTITION",
+        }
+
     # and now until the end:
     t4 = MockTask(1024, 2048)
-    f4 = d / "prefix_1024_2048"
-    _touch(f4)
+    f4 = d / "scan_000123_data_000005.h5"
+    _touch(f4, num_frames=1024)
     c.handle_task(t4, q)
     with q.get(block=False) as msg:
         msg, _ = msg
@@ -223,4 +253,10 @@ def test_files_controller_handle_task(tmp_path):
             "file": str(f4),
             "file_start_idx": 1024,
             "file_end_idx": 2048,
+        }
+
+    with q.get(block=False) as msg:
+        msg, _ = msg
+        assert msg == {
+            "type": "END_PARTITION",
         }

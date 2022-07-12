@@ -2,62 +2,137 @@ from contextlib import contextmanager
 import os
 import re
 import time
+import glob
 import logging
-from typing import Callable, Generator, Iterable, List, Optional, Tuple
+from typing import (
+    Callable, Generator, Iterable, List, Optional, Set, Tuple
+)
 
 import numpy as np
 from opentelemetry import trace
+import h5py
 
 from libertem.common import Shape, Slice
 from libertem.common.executor import (
     MainController, TaskProtocol, WorkerQueue, WorkerContext,
 )
 from libertem.io.dataset.base import (
-    DataTile, DataSetMeta, BasePartition, Partition, DataSet, TilingScheme,
+    DataSetMeta, BasePartition, Partition, DataSet,
 )
+from libertem.io.dataset.hdf5 import H5Reader, H5Partition
 from libertem_live.detectors.base.acquisition import AcquisitionMixin
 
 
-FN_PAT = re.compile(r'^.*_(?P<start_idx>[0-9]+)_(?P<end_idx>[0-9]+)(\..*)?$')
+# scan_00026_data_000013.h5
+FN_PAT = re.compile(r'^scan_(?P<scan>[0-9]+)_data_(?P<series_idx>[0-9]+)\.h5$')
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
 
-class FileWatcherSource:
-    def __init__(self, base_path: str):
-        self._base_path = base_path
+class SingleFile:
+    def __init__(self, path: str, ds_path: str):
+        self._path = path
+        self._ds_path = ds_path
 
-    def _get_start_stop(self, path: str) -> Tuple[int, int]:
-        # FIXME: let's assume we get file names in the form
-        # prefix_{startidx}_{endidx}.ext -> let's parse that!
-        # in reailty, this will probably be different and
-        # highly dependent on what software is writing these files
-        m = FN_PAT.match(path)
-        if not m:
-            raise RuntimeError(
-                "file does not match the given pattern"
-            )
-        match = m.groupdict()
-        return (
-            int(match['start_idx']),
-            int(match['end_idx']),
+    def is_successor_of(self, other: "Optional[SingleFile]") -> bool:
+        """
+        Return True if this file is the direct succesor of `other`.
+
+        Parameters
+        ----------
+        other : SingleFile
+            _description_
+        """
+        if other is None:
+            return self.series_index == 1
+        return self.series_index == other.series_index + 1
+
+    @contextmanager
+    def ds(self) -> h5py.Dataset:
+        with h5py.File(self._path, "r") as f:
+            ds = f[self._ds_path]
+            yield ds
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self._path)
+
+    @property
+    def path(self):
+        return self._path
+
+    @property
+    def series_index(self) -> int:
+        """
+        Index of this file in the series. Starts at 1.
+        """
+        m = FN_PAT.match(self.name)
+        assert m is not None
+        return int(m.groupdict()['series_idx'])
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        with self.ds() as ds:
+            return ds.shape
+
+    @property
+    def num_frames(self) -> int:
+        return self.shape[0]
+
+    @property
+    def dtype(self) -> np.dtype:
+        with self.ds() as ds:
+            return ds.dtype
+
+    def __hash__(self):
+        return hash((self._path, self._ds_path))
+
+    def __repr__(self):
+        return f"<SingleFile {self.name}>"
+
+    def add_indices(self, start_idx: int, end_idx: int) -> "FileWithIndices":
+        return FileWithIndices(
+            path=self._path,
+            ds_path=self._ds_path,
+            start_idx=start_idx,
+            end_idx=end_idx,
         )
 
-    def _poll_for_files(self) -> Iterable[Tuple[str, Tuple[int, int]]]:
+
+class FileWithIndices(SingleFile):
+    def __init__(self, path: str, ds_path: str, start_idx: int, end_idx: int):
+        super().__init__(path, ds_path)
+        self._start_idx = start_idx
+        self._end_idx = end_idx
+
+    @property
+    def start_idx(self) -> int:
+        return self._start_idx
+
+    @property
+    def end_idx(self) -> int:
+        return self._end_idx
+
+
+class FileWatcherSource:
+    def __init__(self, base_path: str, ds_path: str):
+        self._base_path = base_path
+        self._ds_path = ds_path
+
+    def _poll_for_files(self) -> Iterable[SingleFile]:
         logger.debug(f"polling in {self._base_path}")
         # FIXME: use something more efficient, like inotify?
-        files = os.listdir(self._base_path)
-        full_paths = [
-            os.path.join(self._base_path, f)
-            for f in files
-        ]
+        full_paths = glob.glob(f"{self._base_path}/scan_*_data_*.h5")
         return [
-            (path, self._get_start_stop(path))
+            SingleFile(path, self._ds_path)
             for path in full_paths
         ]
 
-    def ordered_files(self, end_idx: int) -> Generator[Optional[Tuple[str, Tuple[int, int]]], None, None]:
+    def ordered_files(
+        self,
+        end_idx: int
+    ) -> Generator[Optional[FileWithIndices], None, None]:
         """
         Generator that yields files sorted by (start, stop).
         Continuously watches a directory, and yields files
@@ -66,7 +141,8 @@ class FileWatcherSource:
         watched directory.
 
         In case of no new files, it yields `None` and gives the
-        user a chance to do 
+        user a chance to wait, for example for external events,
+        or perform any other work.
 
         Parameters
         ----------
@@ -74,33 +150,40 @@ class FileWatcherSource:
             When reaching this index, we are done and will stop watching
         """
         # which files have we yielded already?
-        files_done = {}
+        files_done: Set[SingleFile] = set()
 
-        # the next file should have this as start index:
-        next_start_idx = 0
+        # the last file we yielded was this one:
+        last_file = None
+
+        # number of frames we have already yielded
+        idx = 0
 
         while True:
             # slice here means a tuple (start_idx, end_idx)
-            files_and_slices = self._poll_for_files()
+            files = self._poll_for_files()
             todo_files = [
-                (f, slice_)
-                for (f, slice_) in files_and_slices
-                if f not in files_done
+                single_file
+                for single_file in files
+                if single_file not in files_done
             ]
-            # sort by slice
-            todo_files = sorted(todo_files, key=lambda x: x[1])
+            # sort by index
+            todo_files = sorted(todo_files, key=lambda x: x.series_index)
             if len(todo_files) == 0:
                 yield None
                 continue
             yielded = 0
-            for (f, slice_) in todo_files:
-                if slice_[0] == next_start_idx:
+            for single_file in todo_files:
+                if single_file.is_successor_of(last_file):
                     # this is the one, mark and yield it!
-                    files_done[f] = (f, slice_)
-                    logger.debug(f"yielding {f}")
-                    yield (f, slice_)
+                    files_done.add(single_file)
+                    logger.debug(f"yielding {single_file}")
+                    yield single_file.add_indices(
+                        start_idx=idx,
+                        end_idx=idx + single_file.num_frames,
+                    )
                     yielded += 1
-                    next_start_idx = slice_[1]
+                    idx += single_file.num_frames
+                    last_file = single_file
                     # in case we get all files in-order, the next iteration
                     # of this loop will hit the condition again etc.
                     # otherwise we will again get the files we didn't
@@ -109,29 +192,36 @@ class FileWatcherSource:
                 yield None
 
             # we are done:
-            if next_start_idx >= end_idx:
+            if idx >= end_idx:
                 break
 
 
 class FileWatcherIterator:
-    def __init__(self, base_path: str, end_idx: int, sleep_time: float = 0.3, timeout : float = 10):
+    def __init__(
+        self,
+        base_path: str,
+        end_idx: int,
+        ds_path: str,
+        sleep_time: float = 0.3,
+        timeout: float = 10,
+    ):
         self._base_path = base_path
         self._sleep_time = sleep_time
         self._timeout = timeout
 
         # files and slices of already-sorted files, ascending by indices
-        self._todo_sorted: List[Tuple[str, Tuple[int, int]]] = []
-        self._watcher = FileWatcherSource(base_path)
+        self._todo_sorted: List[FileWithIndices] = []
+        self._watcher = FileWatcherSource(base_path=base_path, ds_path=ds_path)
         self._ordered_files = self._watcher.ordered_files(end_idx)
 
     def __iter__(self):
         return self
 
-    def __next__(self):
+    def __next__(self) -> FileWithIndices:
         # we have ready-to-use files, return the next one:
         if len(self._todo_sorted) > 0:
-            file, (start_idx, end_idx) = self._todo_sorted.pop(0)
-            return file, (start_idx, end_idx)
+            file = self._todo_sorted.pop(0)
+            return file
 
         # otherwise, block and wait for new files:
         try:
@@ -142,13 +232,12 @@ class FileWatcherIterator:
                     raise RuntimeError("timeout while waiting for new files")
                 time.sleep(self._sleep_time)
                 next_file = next(self._ordered_files)
-            file, (start_idx, end_idx) = next_file
-            return file, (start_idx, end_idx)
+            return next_file
         except StopIteration:
             # FIXME: add check: are we really done already?
             raise
 
-    def put_back(self, file, slice_):
+    def put_back(self, file: FileWithIndices):
         """
         Put back a file that was not completely processed into
         the queue, together with its slice information.
@@ -157,16 +246,25 @@ class FileWatcherIterator:
         ----------
         file : _type_
             _description_
-        slice_ : _type_
-            _description_
         """
-        self._todo_sorted.insert(0, (file, slice_))
+        self._todo_sorted.insert(0, file)
 
 
 class FilesController(MainController):
-    def __init__(self, base_path: str, end_idx: int, timeout: float = 10):
+    def __init__(
+        self,
+        base_path: str,
+        ds_path: str,
+        end_idx: int,
+        timeout: float = 10,
+    ):
         self._base_path = base_path
-        self._files_iterator = FileWatcherIterator(base_path, end_idx, timeout=timeout)
+        self._files_iterator = FileWatcherIterator(
+            base_path,
+            end_idx,
+            ds_path=ds_path,
+            timeout=timeout
+        )
 
     def handle_task(self, task: TaskProtocol, queue: WorkerQueue):
         slice_ = task.get_partition().slice
@@ -177,21 +275,23 @@ class FilesController(MainController):
         # NOTE: assumption: the files are generally structured like a 4D STEM
         # data set, mapping well to a linear index over the rectangular scanned
         # region
-        for file, (file_start_idx, file_end_idx) in self._files_iterator:
+        for file in self._files_iterator:
             queue.put({
                 "type": "NEW_FILE",
-                "file": file,
-                "file_start_idx": file_start_idx,
-                "file_end_idx": file_end_idx,
+                "file": file.path,
+                "file_start_idx": file.start_idx,
+                "file_end_idx": file.end_idx,
             })
             # there is more data than belongs to this partition,
             # so we push it back to be returned on the next
             # call of __next__ on the iterator:
-            if file_end_idx > p_end_idx:  # FIXME: off-by-one maybe?
-                self._files_iterator.put_back(file, (file_start_idx, file_end_idx))
+            if file.end_idx > p_end_idx:  # FIXME: off-by-one maybe?
+                self._files_iterator.put_back(file)
                 return  # we are done with this task
-            elif file_end_idx == p_end_idx:
-                # self._files_iterator.
+            elif file.end_idx == p_end_idx:
+                queue.put({
+                    "type": "END_PARTITION",
+                })
                 return
             else:
                 pass  # file_end_idx < p_end_idx, we still have work todo
@@ -208,11 +308,13 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
         self,
         trigger: Callable,
         base_path: str,
+        ds_path: str,
         nav_shape: Tuple[int, int],
         sig_shape: Tuple[int, int],
         timeout: float = 10.0,
     ):
         self._base_path = base_path
+        self._ds_path = ds_path
         self._timeout = timeout
         self._nav_shape = nav_shape
         self._sig_shape = sig_shape
@@ -270,8 +372,6 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
         num_frames = np.prod(self._nav_shape, dtype=np.uint64)
         num_partitions = int(num_frames // self._frames_per_partition)
 
-        header = self.raw_socket.get_acquisition_header()
-
         slices = BasePartition.make_slices(self.shape, num_partitions)
         for part_slice, start, stop in slices:
             yield WatcherLivePartition(
@@ -284,18 +384,59 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
     def get_controller(self) -> MainController:
         return FilesController(
             base_path=self._base_path,
+            ds_path=self._ds_path,
             end_idx=self.shape.nav.size,
             timeout=self._timeout,
         )
 
-    
+
+def _get_partitions(
+    queue: WorkerQueue,
+    meta: DataSetMeta,
+    ds_path: str,
+    outer_slice: Slice
+):
+    while True:
+        with queue.get() as msg:
+            header, payload = msg
+            header_type = header["type"]
+            if header_type == "NEW_FILE":
+                reader = H5Reader(header["file"], ds_path)
+                f_start_idx = header["file_start_idx"]
+                f_end_idx = header["file_end_idx"]
+                with reader.get_h5ds() as h5ds:
+                    chunks = h5ds.chunks
+                file_slice = Slice(
+                    (f_start_idx, 0, 0),
+                    Shape((f_end_idx - f_start_idx), + meta.shape.sig, sig_dims=meta.sig.dims)
+                )
+                pslice = file_slice.intersection_with(outer_slice)
+                partition = H5Partition(
+                    reader=reader,
+                    chunks=chunks,
+                    meta=meta,
+                    partition_slice=pslice,
+                    slice_nd=pslice,
+                    io_backend=None,
+                    decoder=None,
+                )
+                yield partition
+            elif header_type == "END_PARTITION":
+                return
+            else:
+                raise RuntimeError(
+                    f"invalid header type {header['type']}; NEW_FILE or END_PARTITION expected"
+                )
+
+
 class WatcherLivePartition(Partition):
-    def __init__(self, start_idx, end_idx, partition_slice, meta):
+    def __init__(self, start_idx, end_idx, partition_slice, ds_path, meta):
         super().__init__(
             meta=meta, partition_slice=partition_slice, io_backend=None, decoder=None
         )
         self._start_idx = start_idx
         self._end_idx = end_idx
+        self._ds_path = ds_path
 
     def shape_for_roi(self, roi):
         return self.slice.adjust_for_roi(roi).shape
@@ -314,60 +455,18 @@ class WatcherLivePartition(Partition):
     def set_worker_context(self, worker_context: WorkerContext):
         self._worker_context = worker_context
 
-    def _get_tiles_fullframe(self, tiling_scheme: TilingScheme, dest_dtype="float32", roi=None):
-        # assert len(tiling_scheme) == 1
-        tiling_scheme = tiling_scheme.adjust_for_partition(self)
-        logger.debug("reading up to frame idx %d for this partition", self._end_idx)
-
-        queue = self._worker_context.get_worker_queue()
-        frames = get_frames_from_queue(
-            queue,
-            tiling_scheme,
-            self.shape.sig.to_tuple(),
-            dtype=dest_dtype
-        )
-
-        # special case: copy from the decode buffer into a larger partition buffer
-        # can be further optimized if needed (by directly decoding into said buffer)
-        if tiling_scheme.intent == "partition":
-            frame_stack = _accum_partition(
-                frames,
-                tiling_scheme,
-                self.shape.sig.to_tuple(),
-                dtype=dest_dtype
-            )
-            tile_shape = Shape(
-                frame_stack.shape,
-                sig_dims=2
-            )
-            tile_slice = Slice(
-                origin=(self._start_idx,) + (0, 0),
-                shape=tile_shape,
-            )
-            yield DataTile(
-                frame_stack,
-                tile_slice=tile_slice,
-                scheme_idx=0,
-            )
-            return
-
-        for frame_stack, start_idx in frames:
-            tile_shape = Shape(
-                frame_stack.shape,
-                sig_dims=2
-            )
-            tile_slice = Slice(
-                origin=(start_idx,) + (0, 0),
-                shape=tile_shape,
-            )
-            yield DataTile(
-                frame_stack,
-                tile_slice=tile_slice,
-                scheme_idx=0,
-            )
-
     def get_tiles(self, tiling_scheme, dest_dtype="float32", roi=None):
-        yield from self._get_tiles_fullframe(tiling_scheme, dest_dtype, roi)
+        queue = self._worker_context.get_worker_queue()
+        assert self.slice.shape.dims == 1
+        assert tiling_scheme.intent != "partition", "for now, assume we don't need to accumulate partitions"
+        partitions = _get_partitions(
+            queue=queue,
+            meta=self.meta,
+            ds_path=self._ds_path,
+            outer_slice=self.slice,
+        )
+        for p in partitions:
+            yield from p.get_tiles(tiling_scheme, dest_dtype, roi)
 
     def __repr__(self):
-        return f"<MerlinLivePartition {self._start_idx}:{self._end_idx}>"
+        return f"<WatcherLivePartition {self._start_idx}:{self._end_idx}>"
