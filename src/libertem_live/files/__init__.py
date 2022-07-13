@@ -5,7 +5,7 @@ import time
 import glob
 import logging
 from typing import (
-    Callable, Generator, Iterable, List, Optional, Set, Tuple
+    Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Tuple
 )
 
 import numpy as np
@@ -17,10 +17,12 @@ from libertem.common.executor import (
     MainController, TaskProtocol, WorkerQueue, WorkerContext,
 )
 from libertem.io.dataset.base import (
-    DataSetMeta, BasePartition, Partition, DataSet,
+    DataSetMeta, BasePartition, Partition, DataSet, DataTile,
 )
 from libertem.io.dataset.hdf5 import H5Reader, H5Partition
 from libertem_live.detectors.base.acquisition import AcquisitionMixin
+
+from . import zeromq
 
 
 # scan_00026_data_000013.h5
@@ -31,9 +33,9 @@ tracer = trace.get_tracer(__name__)
 
 
 class SingleFile:
-    def __init__(self, path: str, ds_path: str):
+    def __init__(self, path: str, data_path: str):
         self._path = path
-        self._ds_path = ds_path
+        self._data_path = data_path
 
     def is_successor_of(self, other: "Optional[SingleFile]") -> bool:
         """
@@ -51,7 +53,7 @@ class SingleFile:
     @contextmanager
     def ds(self) -> h5py.Dataset:
         with h5py.File(self._path, "r") as f:
-            ds = f[self._ds_path]
+            ds = f[self._data_path]
             yield ds
 
     @property
@@ -86,7 +88,7 @@ class SingleFile:
             return ds.dtype
 
     def __hash__(self):
-        return hash((self._path, self._ds_path))
+        return hash((self._path, self._data_path))
 
     def __repr__(self):
         return f"<SingleFile {self.name}>"
@@ -94,15 +96,25 @@ class SingleFile:
     def add_indices(self, start_idx: int, end_idx: int) -> "FileWithIndices":
         return FileWithIndices(
             path=self._path,
-            ds_path=self._ds_path,
+            data_path=self._data_path,
             start_idx=start_idx,
             end_idx=end_idx,
         )
 
+    def wait_until_exists(self, timeout: float, sleep: float = 1):
+        t0 = time.time()
+        while True:
+            if time.time() - t0 > timeout:
+                raise RuntimeError("timeout while waiting for file to manifest")
+            if os.path.exists(self.path):
+                return
+            else:
+                time.sleep(sleep)
+
 
 class FileWithIndices(SingleFile):
-    def __init__(self, path: str, ds_path: str, start_idx: int, end_idx: int):
-        super().__init__(path, ds_path)
+    def __init__(self, path: str, data_path: str, start_idx: int, end_idx: int):
+        super().__init__(path, data_path)
         self._start_idx = start_idx
         self._end_idx = end_idx
 
@@ -116,16 +128,16 @@ class FileWithIndices(SingleFile):
 
 
 class FileWatcherSource:
-    def __init__(self, base_path: str, ds_path: str):
+    def __init__(self, base_path: str, data_path: str):
         self._base_path = base_path
-        self._ds_path = ds_path
+        self._data_path = data_path
 
     def _poll_for_files(self) -> Iterable[SingleFile]:
         logger.debug(f"polling in {self._base_path}")
         # FIXME: use something more efficient, like inotify?
         full_paths = glob.glob(f"{self._base_path}/scan_*_data_*.h5")
         return [
-            SingleFile(path, self._ds_path)
+            SingleFile(path, self._data_path)
             for path in full_paths
         ]
 
@@ -201,7 +213,7 @@ class FileWatcherIterator:
         self,
         base_path: str,
         end_idx: int,
-        ds_path: str,
+        data_path: str,
         sleep_time: float = 0.3,
         timeout: float = 10,
     ):
@@ -211,7 +223,7 @@ class FileWatcherIterator:
 
         # files and slices of already-sorted files, ascending by indices
         self._todo_sorted: List[FileWithIndices] = []
-        self._watcher = FileWatcherSource(base_path=base_path, ds_path=ds_path)
+        self._watcher = FileWatcherSource(base_path=base_path, data_path=data_path)
         self._ordered_files = self._watcher.ordered_files(end_idx)
 
     def __iter__(self):
@@ -250,20 +262,168 @@ class FileWatcherIterator:
         self._todo_sorted.insert(0, file)
 
 
+class EventSource:
+    def __init__(self):
+        pass
+
+    def receive_message(self, timeout: float):
+        pass
+
+
+class ZMQEventSource(EventSource):
+    def __init__(self, host: str, port: int):
+        self._client_sub = zeromq.ClientSub(host, port)
+        # subscribe to interesting topics:
+        self._client_sub.add_subscription_topic("scan_finished")
+        self._client_sub.add_subscription_topic("scan_started")
+        self._client_sub.add_subscription_topic("new_file")
+
+    def receive_message(self, timeout: Optional[float] = None):
+        return self._client_sub.receive_message(timeout=timeout)
+
+
+class MockEventSource(EventSource):
+    def __init__(self):
+        self._messages = []
+
+    def receive_message(self, timeout: float):
+        if len(self._messages) > 0:
+            return self._messages.pop(0)
+
+    def put_msg(self, msg):
+        self._messages.append(msg)
+
+
+class EventFileIterator:
+    def __init__(
+        self,
+        events: EventSource,
+        detector_name: str,  # 
+        sleep_time: float = 0.3,
+        timeout: float = 10,
+    ):
+        self._sleep_time = sleep_time
+        self._detector_name = detector_name
+        self._timeout = timeout
+        self._events = events
+
+        # files and slices of already-sorted files, ascending by indices
+        self._todo_sorted: List[FileWithIndices] = []
+
+        self._scan_metadata = None
+
+    def wait_for_start(self, timeout: Optional[float] = None) -> Dict:
+        if timeout is None:
+            timeout = self._timeout
+        t0 = time.time()
+        while True:
+            t = time.time()
+            spent = t - t0
+            timeout_here = timeout - spent
+            if timeout_here <= 0:
+                raise RuntimeError("timeout while waiting for scan_started")
+            msg = self._events.receive_message(timeout=timeout_here)
+            if msg is None:
+                raise RuntimeError("timeout while waiting for scan_started")
+            metadata, topic = msg
+            if topic == "scan_started":
+                self._scan_metadata = metadata
+                self._validate()
+                return metadata
+            else:
+                continue
+
+    def __iter__(self):
+        return self
+
+    @property
+    def base_path(self):
+        assert self._scan_metadata is not None
+        return self._scan_metadata["scan"]["scan_directory_core"]
+
+    def _validate(self):
+        # throws an exception if data path can't be determined:
+        assert self.data_path is not None
+
+    @property
+    def data_path(self):
+        """
+        Path to the Dataset inside the HDF5 file
+        """
+        if self._detector_name not in self._scan_metadata["detectors"]:
+            names = ", ".join(list(self._scan_metadata["detectors"].keys()))
+            raise ValueError(
+                f"invalid detector name '{self._detector_name}', have {names}"
+            )
+        return self._scan_metadata["detectors"][self._detector_name]["data"]["image"]["0"]["data_path"]
+
+    def __next__(self) -> FileWithIndices:
+        if self._scan_metadata is None:
+            raise RuntimeError("wrong state; call `wait_for_start` first")
+
+        # we have ready-to-use files, return the next one:
+        if len(self._todo_sorted) > 0:
+            file = self._todo_sorted.pop(0)
+            return file
+
+        # otherwise, block and wait for new files:
+        msg = self._events.receive_message(timeout=self._timeout)
+        if msg is None:
+            raise RuntimeError("timeout while waiting for message")
+        metadata, topic = msg
+
+        if topic == "new_file":
+            # keys:
+            #  - acquisition_index
+            #  - acquisitions_in_file
+            #  - detector_name
+            #  - detector_type
+            #  - file_index
+            #  - filename
+            #  - frame_axis
+            #  - source
+            new_file = metadata["file"]
+            file = FileWithIndices(
+                path=os.path.join(self.base_path, new_file["filename"]),
+                # FIXME: get the `data_path` from the `scan_started` event?
+                data_path=self.data_path,
+                start_idx=new_file["acquisition_index"][0],
+                end_idx=new_file["acquisition_index"][1],
+            )
+            # FIXME: different timeout?
+            file.wait_until_exists(timeout=self._timeout)
+            return file
+        elif topic == "scan_finished":
+            raise StopIteration()
+        elif topic == "scan_started":
+            raise RuntimeError("unexpected `scan_started` message")
+        else:
+            raise RuntimeError(f"unexpected topic {topic}")
+
+    def put_back(self, file: FileWithIndices):
+        """
+        Put back a file that was not completely processed into
+        the queue, together with its slice information.
+
+        Parameters
+        ----------
+        file : _type_
+            _description_
+        """
+        self._todo_sorted.insert(0, file)
+
+
 class FilesController(MainController):
     def __init__(
         self,
-        base_path: str,
-        ds_path: str,
-        end_idx: int,
+        event_source: EventSource,
+        detector_name: str,
         timeout: float = 10,
     ):
-        self._base_path = base_path
-        self._files_iterator = FileWatcherIterator(
-            base_path,
-            end_idx,
-            ds_path=ds_path,
-            timeout=timeout
+        self._files_iterator = EventFileIterator(
+            events=event_source,
+            timeout=timeout,
+            detector_name=detector_name,
         )
 
     def handle_task(self, task: TaskProtocol, queue: WorkerQueue):
@@ -308,13 +468,11 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
         self,
         trigger: Callable,
         base_path: str,
-        ds_path: str,
         nav_shape: Tuple[int, int],
         sig_shape: Tuple[int, int],
         timeout: float = 10.0,
     ):
         self._base_path = base_path
-        self._ds_path = ds_path
         self._timeout = timeout
         self._nav_shape = nav_shape
         self._sig_shape = sig_shape
@@ -384,7 +542,7 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
     def get_controller(self) -> MainController:
         return FilesController(
             base_path=self._base_path,
-            ds_path=self._ds_path,
+            data_path=self._data_path,
             end_idx=self.shape.nav.size,
             timeout=self._timeout,
         )
@@ -393,7 +551,7 @@ class WatcherAcquisition(AcquisitionMixin, DataSet):
 def _get_partitions(
     queue: WorkerQueue,
     meta: DataSetMeta,
-    ds_path: str,
+    data_path: str,
     outer_slice: Slice
 ):
     while True:
@@ -401,7 +559,7 @@ def _get_partitions(
             header, payload = msg
             header_type = header["type"]
             if header_type == "NEW_FILE":
-                reader = H5Reader(header["file"], ds_path)
+                reader = H5Reader(header["file"], data_path)
                 f_start_idx = header["file_start_idx"]
                 f_end_idx = header["file_end_idx"]
                 with reader.get_h5ds() as h5ds:
@@ -430,13 +588,13 @@ def _get_partitions(
 
 
 class WatcherLivePartition(Partition):
-    def __init__(self, start_idx, end_idx, partition_slice, ds_path, meta):
+    def __init__(self, start_idx, end_idx, partition_slice, data_path, meta):
         super().__init__(
             meta=meta, partition_slice=partition_slice, io_backend=None, decoder=None
         )
         self._start_idx = start_idx
         self._end_idx = end_idx
-        self._ds_path = ds_path
+        self._data_path = data_path
 
     def shape_for_roi(self, roi):
         return self.slice.adjust_for_roi(roi).shape
@@ -456,13 +614,15 @@ class WatcherLivePartition(Partition):
         self._worker_context = worker_context
 
     def get_tiles(self, tiling_scheme, dest_dtype="float32", roi=None):
+        tiling_scheme = tiling_scheme.adjust_for_partition(self)
         queue = self._worker_context.get_worker_queue()
         assert self.slice.shape.dims == 1
-        assert tiling_scheme.intent != "partition", "for now, assume we don't need to accumulate partitions"
+        assert tiling_scheme.intent != "partition",\
+            "for now, assume we don't need to accumulate partitions"
         partitions = _get_partitions(
             queue=queue,
             meta=self.meta,
-            ds_path=self._ds_path,
+            data_path=self._data_path,
             outer_slice=self.slice,
         )
         for p in partitions:
@@ -470,3 +630,13 @@ class WatcherLivePartition(Partition):
 
     def __repr__(self):
         return f"<WatcherLivePartition {self._start_idx}:{self._end_idx}>"
+
+
+def enrich_with_metadata(tiles: Generator[DataTile, None, None]):
+    for tile in tiles:
+        # inspect `tile.tile_slice.nav`
+        positions = get_positions_for(tile.tile_slice)
+        tile.set_meta({
+            "positions": positions,
+        })
+        yield tile
